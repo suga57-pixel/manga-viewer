@@ -16,10 +16,67 @@ const $=id=>document.getElementById(id);let db,books=[],current=null,source=null
 function toast(msg){$('toast').textContent=msg;$('toast').style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').style.display='none',5500)}
 function busy(msg){document.body.classList.toggle('busy',!!msg);$('busyText').textContent=msg||''}
 function request(req){return new Promise((resolve,reject)=>{req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error)})}
-function transaction(mode,fn){return new Promise((resolve,reject)=>{const tx=db.transaction('books',mode);fn(tx.objectStore('books'));tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('保存中断'))})}
-async function init(){try{const req=indexedDB.open('yohaku-library',1);req.onupgradeneeded=()=>req.result.createObjectStore('books',{keyPath:'id'});db=await request(req);await refresh()}catch(e){toast('端末内保存を利用できません。通常モードで開き直してください。');$('add').disabled=true;$('emptyAdd').disabled=true}}
-async function refresh(){const all=await request(db.transaction('books').objectStore('books').getAll());books=all.map(({blob,...meta})=>meta);drawLibrary()}
-function drawLibrary(){const q=$('search').value.toLocaleLowerCase();const items=books.filter(b=>b.name.toLocaleLowerCase().includes(q)).sort($('sort').value==='name'?(a,b)=>collator.compare(a.name,b.name):(a,b)=>b.last-a.last);$('grid').replaceChildren();$('empty').hidden=books.length>0;$('count').textContent=books.length+' 冊';for(const b of items){const card=document.createElement('article');card.className='card';const cover=document.createElement('button');cover.className='cover';cover.setAttribute('aria-label',b.name+'を読む');if(b.cover){const img=document.createElement('img');img.src=b.cover;img.alt='';cover.append(img)}else{const fallback=document.createElement('div');fallback.className='fallback';fallback.textContent=b.name;cover.append(fallback)}const badge=document.createElement('span');badge.className='badge';badge.textContent=b.kind.toUpperCase();cover.append(badge);cover.onclick=()=>openBook(b.id);const title=document.createElement('h3');title.textContent=b.name;const meta=document.createElement('div');meta.className='meta';const position=document.createElement('span');position.textContent=b.total?`${(b.page||0)+1} / ${b.total} ページ`:'未読';const del=document.createElement('button');del.className='delete';del.textContent='削除';del.setAttribute('aria-label',b.name+'を本棚から削除');del.onclick=async()=>{if(!confirm('「'+b.name+'」の端末内コピー・表紙・読書履歴を削除しますか？\n iCloud Driveの原本は削除されません。'))return;try{await transaction('readwrite',s=>s.delete(b.id));await refresh()}catch(e){toast('削除できませんでした')}};meta.append(position,del);const track=document.createElement('div');track.className='track';const fill=document.createElement('i');fill.style.width=(b.total?Math.round(((b.page||0)+1)/b.total*100):0)+'%';track.append(fill);card.append(cover,title,meta,track);$('grid').append(card)}}
+// Connections may be closed by Safari while the page is suspended.
+let openingDB=null;
+const invalidConnections=new WeakSet();
+function invalidateDB(connection){
+ if(!connection)return;
+ invalidConnections.add(connection);
+ if(db===connection)db=null;
+ try{connection.close()}catch(_){}
+}
+function getDB(){
+ if(db)return Promise.resolve(db);
+ if(openingDB)return openingDB;
+ const pending=new Promise((resolve,reject)=>{
+  const req=indexedDB.open('yohaku-library',1);
+  req.onupgradeneeded=()=>{if(!req.result.objectStoreNames.contains('books'))req.result.createObjectStore('books',{keyPath:'id'})};
+  req.onblocked=()=>toast('保存DBが別のタブで使用されています。ほかの漫画ビューアのタブを閉じてください。');
+  req.onerror=()=>reject(req.error||Error('保存DBを開けません'));
+  req.onsuccess=()=>{
+   const connection=req.result;
+   connection.onclose=()=>invalidateDB(connection);
+   connection.onversionchange=()=>invalidateDB(connection);
+   db=connection;resolve(connection);
+  };
+ });
+ openingDB=pending;
+ pending.then(()=>{if(openingDB===pending)openingDB=null},()=>{if(openingDB===pending)openingDB=null});
+ return pending;
+}
+function isQuotaError(error){return error?.name==='QuotaExceededError'}
+function storageMessage(error){
+ if(isQuotaError(error))return '端末内の保存容量が不足しています。空き容量を確保してから再度取り込んでください。';
+ if(['InvalidStateError','AbortError','UnknownError'].includes(error?.name))return '保存DBへの接続が中断されました。再度お試しください。';
+ return error?.message||'保存処理に失敗しました';
+}
+// Callbacks enqueue IDB requests synchronously. Never await work inside a transaction.
+// Replay only after creation failed or the entire transaction aborted, never on request success.
+async function transaction(mode,fn){
+ for(let attempt=0;;attempt++){
+  let connection;
+  try{
+   connection=await getDB();
+   return await new Promise((resolve,reject)=>{
+    let tx,result,requestError,callbackError;
+    try{tx=connection.transaction('books',mode)}catch(e){reject(e);return}
+    tx.oncomplete=()=>resolve(result?.result);
+    tx.onerror=event=>{requestError=event.target.error||tx.error};
+    tx.onabort=()=>reject(callbackError||requestError||tx.error||new DOMException('保存中断','AbortError'));
+    try{result=fn(tx.objectStore('books'))}catch(e){callbackError=e;try{tx.abort()}catch(_){reject(e)}}
+   });
+  }catch(error){
+   const retryable=!isQuotaError(error)&&(error?.name==='InvalidStateError'||error?.name==='UnknownError'||(error?.name==='AbortError'&&connection&&invalidConnections.has(connection)));
+   if(!retryable||attempt>=2)throw error;
+   invalidateDB(connection);
+   await new Promise(resolve=>setTimeout(resolve,100*(attempt+1)));
+  }
+ }
+}
+const readBook=id=>transaction('readonly',store=>store.get(id));
+async function init(){try{await refresh()}catch(e){toast('端末内保存を利用できません：'+storageMessage(e))}}
+async function refresh(){const all=await transaction('readonly',store=>store.getAll());books=all.map(({blob,...meta})=>meta);drawLibrary()}
+function drawLibrary(){const q=$('search').value.toLocaleLowerCase();const items=books.filter(b=>b.name.toLocaleLowerCase().includes(q)).sort($('sort').value==='name'?(a,b)=>collator.compare(a.name,b.name):(a,b)=>b.last-a.last);$('grid').replaceChildren();$('empty').hidden=books.length>0;$('count').textContent=books.length+' 冊';for(const b of items){const card=document.createElement('article');card.className='card';const cover=document.createElement('button');cover.className='cover';cover.setAttribute('aria-label',b.name+'を読む');if(b.cover){const img=document.createElement('img');img.src=b.cover;img.alt='';cover.append(img)}else{const fallback=document.createElement('div');fallback.className='fallback';fallback.textContent=b.name;cover.append(fallback)}const badge=document.createElement('span');badge.className='badge';badge.textContent=b.kind.toUpperCase();cover.append(badge);cover.onclick=()=>openBook(b.id);const title=document.createElement('h3');title.textContent=b.name;const meta=document.createElement('div');meta.className='meta';const position=document.createElement('span');position.textContent=b.total?`${(b.page||0)+1} / ${b.total} ページ`:'未読';const del=document.createElement('button');del.className='delete';del.textContent='削除';del.setAttribute('aria-label',b.name+'を本棚から削除');del.onclick=async()=>{if(!confirm('「'+b.name+'」の端末内コピー・表紙・読書履歴を削除しますか？\n iCloud Driveの原本は削除されません。'))return;try{await transaction('readwrite',s=>s.delete(b.id));await refresh()}catch(e){toast('削除できませんでした：'+storageMessage(e))}};meta.append(position,del);const track=document.createElement('div');track.className='track';const fill=document.createElement('i');fill.style.width=(b.total?Math.round(((b.page||0)+1)/b.total*100):0)+'%';track.append(fill);card.append(cover,title,meta,track);$('grid').append(card)}}
 // Read ZIP directory and individual compressed entries from Blob slices.
 async function parseZip(blob){
  const tail=new Uint8Array(await blob.slice(Math.max(0,blob.size-65557)).arrayBuffer());
@@ -71,9 +128,7 @@ async function ownedPayload(value){
 }
 function payloadBlob(value){return Array.isArray(value)?value.map(payloadBlob):value?.format==='yohaku-bytes-v1'?new Blob([value.bytes],{type:value.type}):value}
 async function migratePayload(book,payload){
- await new Promise((resolve,reject)=>{const tx=db.transaction('books','readwrite'),store=tx.objectStore('books'),req=store.get(book.id);
- tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('保存中断'));
- req.onsuccess=()=>{if(req.result)store.put({...req.result,blob:payload})};});
+ await transaction('readwrite',store=>{const req=store.get(book.id);req.onsuccess=()=>{if(req.result)store.put({...req.result,blob:payload})}});
 }
 // onload works on Safari even when Image.decode() rejects an otherwise valid image.
 function loadImage(img,url){return new Promise((resolve,reject)=>{img.onload=()=>{img.onload=img.onerror=null;resolve(img)};img.onerror=()=>{img.onload=img.onerror=null;reject(Error('画像を読み込めません（未対応形式または画像破損）'))};img.src=url})}
@@ -82,9 +137,10 @@ if(book.kind==='images'){const images=book.blob;return{total:images.length,get:a
 const entries=await parseZip(book.blob);return{total:entries.length,get:i=>zipPage(book.blob,entries[i])}}
 
 async function thumbnail(blob){const url=URL.createObjectURL(blob);try{const img=new Image();await loadImage(img,url);const c=document.createElement('canvas');c.width=280;c.height=Math.round(img.height*280/img.width);if(c.height>600)c.height=600;c.getContext('2d').drawImage(img,0,0,c.width,c.height);return c.toDataURL('image/jpeg',.75)}finally{URL.revokeObjectURL(url)}}
-$('files').onchange=async e=>{const files=[...e.target.files];e.target.value='';if(!files.length)return;busy('本棚に取り込んでいます…');try{const imageFiles=files.filter(f=>f.type.startsWith('image/')||imagePattern.test(f.name)).sort((a,b)=>collator.compare(a.name,b.name));const jobs=files.filter(f=>!imageFiles.includes(f)).map(f=>({name:f.name.replace(/\.[^.]+$/,''),kind:/\.pdf$/i.test(f.name)?'pdf':/\.(zip|cbz)$/i.test(f.name)?'cbz':'unsupported',blob:f}));if(imageFiles.length)jobs.push({name:imageFiles.length===1?imageFiles[0].name.replace(/\.[^.]+$/,''):imageFiles[0].name.replace(/\.[^.]+$/,'')+' ほか '+(imageFiles.length-1)+'枚',kind:'images',blob:imageFiles});let added=0;const errors=[];for(const job of jobs){let prepared;try{if(job.kind==='unsupported')throw Error('非対応形式です');busy(job.name+'\n読み込み中…');const jobFingerprint=fingerprint(job);const duplicate=books.find(b=>b.fingerprint===jobFingerprint);const previous=duplicate?await request(db.transaction('books').objectStore('books').get(duplicate.id)):null;if(previous&&previous.blob?.format==='yohaku-bytes-v1'){errors.push(job.name+'：取り込み済み');continue}const payload=await ownedPayload(job.blob);prepared=await prepare({...job,blob:payloadBlob(payload)});const cover=await thumbnail(await prepared.get(0));const entry={...job,...(previous||{}),blob:payload,id:previous?.id||(crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random()),fingerprint:jobFingerprint,page:previous?.page||0,total:prepared.total,cover,last:previous?.last||Date.now()};await transaction('readwrite',s=>s.put(entry));books.push({id:entry.id,fingerprint:entry.fingerprint});added++}catch(err){errors.push(job.name+'：'+err.message)}finally{if(prepared?.doc)await prepared.doc.destroy()}}await refresh();toast(added+'冊を取り込みました'+(errors.length?' / '+errors.join(' / '):''))}catch(err){toast(err.message||'取り込みに失敗しました')}finally{busy(null)}};
+let importing=false;
+$('files').onchange=async e=>{if(importing){e.target.value='';toast('取り込み中です。完了してから追加してください。');return}const files=[...e.target.files];e.target.value='';if(!files.length)return;importing=true;busy('本棚に取り込んでいます…');try{const imageFiles=files.filter(f=>f.type.startsWith('image/')||imagePattern.test(f.name)).sort((a,b)=>collator.compare(a.name,b.name));const jobs=files.filter(f=>!imageFiles.includes(f)).map(f=>({name:f.name.replace(/\.[^.]+$/,''),kind:/\.pdf$/i.test(f.name)?'pdf':/\.(zip|cbz)$/i.test(f.name)?'cbz':'unsupported',blob:f}));if(imageFiles.length)jobs.push({name:imageFiles.length===1?imageFiles[0].name.replace(/\.[^.]+$/,''):imageFiles[0].name.replace(/\.[^.]+$/,'')+' ほか '+(imageFiles.length-1)+'枚',kind:'images',blob:imageFiles});let added=0;const errors=[];for(const job of jobs){let prepared;try{if(job.kind==='unsupported')throw Error('非対応形式です');busy(job.name+'\n読み込み中…');const jobFingerprint=fingerprint(job);const duplicate=books.find(b=>b.fingerprint===jobFingerprint);const previous=duplicate?await readBook(duplicate.id):null;if(previous&&previous.blob?.format==='yohaku-bytes-v1'){errors.push(job.name+'：取り込み済み');continue}const payload=await ownedPayload(job.blob);prepared=await prepare({...job,blob:payloadBlob(payload)});const cover=await thumbnail(await prepared.get(0));const entry={...job,...(previous||{}),blob:payload,id:previous?.id||(crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random()),fingerprint:jobFingerprint,page:previous?.page||0,total:prepared.total,cover,last:previous?.last||Date.now()};await transaction('readwrite',s=>s.put(entry));books.push({id:entry.id,fingerprint:entry.fingerprint});added++}catch(err){errors.push(job.name+'：'+storageMessage(err))}finally{if(prepared?.doc)try{await prepared.doc.destroy()}catch(e){console.warn('PDF cleanup',e)}}}await refresh();toast(added+'冊を取り込みました'+(errors.length?' / '+errors.join(' / '):''))}catch(err){toast(err.message||'取り込みに失敗しました')}finally{importing=false;busy(null)}};
 function fingerprint(b){const fs=Array.isArray(b.blob)?b.blob:[b.blob];return JSON.stringify(fs.map(f=>[f.name,f.size,f.lastModified]))}
-async function openBook(id){if(opening)return;opening=true;busy('本を開いています…');try{const b=await request(db.transaction('books').objectStore('books').get(id));if(!b)throw Error('本が見つかりません');const payload=await ownedPayload(b.blob);source=await prepare({...b,blob:payloadBlob(payload)});if(payload!==b.blob){try{await migratePayload(b,payload)}catch(e){toast('読めますが保存形式の更新に失敗しました。空き容量を確認してください。')}}current={...b,blob:payload};page=normalized(Math.max(0,Math.min(b.page||0,source.total-1)));$('bookTitle').textContent=b.name;$('reader').hidden=false;document.body.style.overflow='hidden';await render();$('back').focus()}catch(e){toast('開けませんでした：'+e.message);await closeReader()}finally{busy(null);opening=false}}
+async function openBook(id){if(opening)return;opening=true;busy('本を開いています…');try{const b=await readBook(id);if(!b)throw Error('本が見つかりません');const payload=await ownedPayload(b.blob);source=await prepare({...b,blob:payloadBlob(payload)});if(payload!==b.blob){try{await migratePayload(b,payload)}catch(e){toast('読めますが保存形式の更新に失敗しました：'+storageMessage(e))}}current={...b,blob:payload};page=normalized(Math.max(0,Math.min(b.page||0,source.total-1)));$('bookTitle').textContent=b.name;$('reader').hidden=false;document.body.style.overflow='hidden';await render();$('back').focus()}catch(e){toast('開けませんでした：'+e.message);await closeReader()}finally{busy(null);opening=false}}
 function volumeName(name){const m=name.normalize('NFKC').trim().match(/^(.*?)\s*第\s*([0-9]+)\s*巻$/);return m&&m[1].trim()?{title:m[1].trim().replace(/\s+/g,' '),number:Number(m[2])}:null}
 let switchingVolume=false;async function nextVolume(){if(switchingVolume||opening||!current)return;const v=volumeName(current.name);const next=v&&books.filter(b=>{const n=volumeName(b.name);return n&&n.title===v.title&&n.number===v.number+1}).sort((a,b)=>b.last-a.last)[0];if(!next){alert('次の巻がありません');return}switchingVolume=true;try{await closeReader();await openBook(next.id)}finally{switchingVolume=false}}
 function indices(){return $('layout').value==='spread'&&page>0?[page,...(page+1<source.total?[page+1]:[])]:[page]}
@@ -100,7 +156,7 @@ async function renderPage(token){
  }catch(e){if(token===renderId){$('pages').textContent='このページを表示できません。'+stage+'：'+e.message;urls.forEach(u=>URL.revokeObjectURL(u));urls=[];toast('ページ表示エラー ['+stage+' / '+(e.name||'Error')+']：'+e.message)}}
  finally{if(!committed)nextUrls.forEach(u=>URL.revokeObjectURL(u))}
 }
-async function saveProgress(){if(!current)return;current.page=page;current.last=Date.now();try{const id=current.id;const p=page,last=current.last;await new Promise((resolve,reject)=>{const tx=db.transaction('books','readwrite');const s=tx.objectStore('books');const req=s.get(id);req.onsuccess=()=>{if(req.result)s.put({...req.result,page:p,last})};tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('保存中断'))});}catch(e){toast('進捗を保存できません。端末の空き容量を確認してください')}}
+async function saveProgress(){if(!current)return;current.page=page;current.last=Date.now();const id=current.id,p=page,last=current.last;try{await transaction('readwrite',store=>{const req=store.get(id);req.onsuccess=()=>{if(req.result)store.put({...req.result,page:p,last})}})}catch(e){toast('進捗を保存できません：'+storageMessage(e))}}
 function move(dir){if(!source)return;const step=$('layout').value==='spread'?(page===0&&dir>0?1:2):1;const p=normalized(Math.max(0,Math.min(source.total-1,page+dir*step)));if(p!==page){page=p;render()}}
 async function closeReader(){renderId++;await saveProgress();$('reader').hidden=true;document.body.style.overflow='';$('reader').classList.remove('quiet');$('pages').replaceChildren();urls.forEach(URL.revokeObjectURL);urls=[];const old=source;current=null;source=null;await renderQueue.catch(()=>{});if(old?.doc)await old.doc.destroy();if(db)await refresh();$('add').focus()}
 function transform(){zoom=Math.min(5,Math.max(1,zoom));const r=$('viewport').getBoundingClientRect();panX=Math.max(-r.width*(zoom-1)/2,Math.min(r.width*(zoom-1)/2,panX));panY=Math.max(-r.height*(zoom-1)/2,Math.min(r.height*(zoom-1)/2,panY));$('pages').style.transform=`translate(${panX}px,${panY}px) scale(${zoom})`;$('zoom').textContent=Math.round(zoom*100)+'%'}function resetZoom(){zoom=1;panX=panY=0;transform()}
